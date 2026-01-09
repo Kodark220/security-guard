@@ -57,7 +57,7 @@ class SecurityGuard(gl.Contract):
     threat_alerts: DynArray[str]  # User-friendly alert queue
     ai_recommendations: DynArray[str]  # AI-generated action recommendations
     threat_trends: TreeMap[str, str]  # Risk trends per address as JSON strings (for charts)
-    operator_alerts_enabled: TreeMap[Address, bool]  # Per-operator alert prefs
+    operator_alerts_enabled: TreeMap[str, bool]  # Per-operator alert prefs (address as string key)
     last_system_health_check: u256  # Timestamp of last health check
     predicted_threats: DynArray[str]  # Proactive threat predictions
     system_uptime: u256  # Contract uptime in seconds
@@ -70,6 +70,12 @@ class SecurityGuard(gl.Contract):
     user_watched_list: TreeMap[str, str]  # User → list of contracts they watch JSON
     pre_interaction_warnings: DynArray[str]  # Warnings about upcoming interactions
     contract_vulnerability_db: DynArray[str]  # Known vulnerabilities database
+    
+    # NEW: Wallet connection & dApp integration
+    connected_wallets: TreeMap[str, str]  # Wallet → connection metadata JSON
+    dapp_registry: TreeMap[str, str]  # dApp contract → integration info JSON
+    wallet_health_scores: TreeMap[str, u256]  # Wallet → overall health score (0-100)
+    dapp_health_status: TreeMap[str, str]  # dApp → health status (healthy/warning/critical) JSON
 
 
     # ==================== CONSTRUCTOR ====================
@@ -111,7 +117,7 @@ class SecurityGuard(gl.Contract):
         self.min_risk_for_webhook = u256(70)  # Alert on high+ threats
 
         # Initialize user-friendly features
-        self.operator_alerts_enabled[owner] = True
+        self.operator_alerts_enabled[str(owner)] = True
         self.last_system_health_check = u256(0)
         self.system_uptime = u256(0)
         self.created_at = u256(0)  # Will be set by GenLayer with block timestamp
@@ -1190,7 +1196,7 @@ Return JSON: {{
         if not self._is_operator(sender):
             raise Exception("Only operators can set preferences")
 
-        self.operator_alerts_enabled[sender] = alert_enabled
+        self.operator_alerts_enabled[str(sender)] = alert_enabled
 
         return {
             "success": True,
@@ -1660,6 +1666,8 @@ Return JSON: {{
                 except:
                     pass
 
+        alerts_count = len(self.pre_interaction_warnings)
+        
         return {
             "status": "monitoring_active",
             "total_dapps_monitored": total_contracts,
@@ -1667,7 +1675,7 @@ Return JSON: {{
             "safe_dapps": low_risk_count,
             "require_audit": audit_needed_count,
             "dapp_list": contract_list[:20],  # Top 20
-            "alerts": pre_interaction_warnings_count := len(self.pre_interaction_warnings),
+            "alerts": alerts_count,
             "action_items": high_risk_count + audit_needed_count
         }
 
@@ -1739,6 +1747,398 @@ Return JSON: {{
             "safety_tips": recommendations.get("general_safety_tips", []),
             "priority_switches": recommendations.get("priority_switches", []),
             "message": "Review safer alternatives before interacting with high-risk contracts"
+        }
+
+    # ==================== WALLET CONNECTION & dAPP INTEGRATION ====================
+
+    @gl.public.write
+    def connect_wallet(self) -> dict:
+        """
+        Connect user's wallet to SecurityGuard for monitoring.
+        Automatically called when user interacts with any method.
+
+        Returns:
+            dict: Connection confirmation with wallet health
+        """
+        user = str(gl.message.sender_address)
+        
+        # Create connection record
+        connection_data = {
+            "wallet": user,
+            "connected_at": "current",
+            "monitoring_enabled": True,
+            "auto_scan_enabled": True,
+            "alerts_enabled": True,
+            "health_score": 0
+        }
+        
+        self.connected_wallets[user] = json.dumps(connection_data)
+        
+        # Initialize wallet health score
+        self.wallet_health_scores[user] = u256(100)
+        
+        return {
+            "success": True,
+            "wallet": user,
+            "status": "connected",
+            "message": "Wallet connected to SecurityGuard. Your dApp interactions will be monitored.",
+            "features": [
+                "Real-time dApp health monitoring",
+                "Pre-interaction security warnings",
+                "Wallet security scanning",
+                "Interaction history tracking",
+                "Risk alerts on suspicious activity"
+            ],
+            "health_score": 100
+        }
+
+
+    @gl.public.write
+    def register_dapp(self, dapp_addr: str, dapp_name: str, dapp_type: str) -> dict:
+        """
+        Register a dApp for integration with SecurityGuard.
+        Enables cross-dApp security monitoring.
+
+        Args:
+            dapp_addr: dApp contract address
+            dapp_name: dApp name (e.g., "Uniswap", "AAVE")
+            dapp_type: dApp type (DEX, Lending, Staking, etc.)
+
+        Returns:
+            dict: Registration confirmation
+        """
+        addr_lower = dapp_addr.lower()
+        
+        # Register dApp
+        dapp_info = {
+            "address": dapp_addr,
+            "name": dapp_name,
+            "type": dapp_type,
+            "registered_at": "current",
+            "users_count": 0,
+            "security_audit_status": "pending"
+        }
+        
+        self.dapp_registry[addr_lower] = json.dumps(dapp_info)
+        
+        # Set initial health status (analyze dApp)
+        def analyze_dapp() -> str:
+            prompt = f"""Analyze this dApp for security and health:
+
+dApp: {dapp_name}
+Address: {dapp_addr}
+Type: {dapp_type}
+
+Provide a health assessment:
+1. Known security issues or vulnerabilities
+2. Community reputation
+3. Audit status
+4. Overall health status (healthy/warning/critical)
+5. Risk warnings
+
+Return JSON: {{
+    "health_status": "<healthy|warning|critical>",
+    "security_issues": ["<issue1>"],
+    "audit_status": "<audited|pending|not_audited>",
+    "risk_level": "<low|medium|high|critical>",
+    "warnings": ["<warning1>"],
+    "recommendation": "<action>"
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        analysis_raw = gl.eq_principle.prompt_non_comparative(
+            analyze_dapp,
+            task="Analyze dApp health and security",
+            criteria="Health status must be healthy/warning/critical"
+        )
+
+        dapp_health = self._parse_llm_json(analysis_raw, {
+            "health_status": "unknown",
+            "security_issues": [],
+            "audit_status": "unknown",
+            "risk_level": "unknown",
+            "warnings": [],
+            "recommendation": "Monitor this dApp"
+        })
+
+        self.dapp_health_status[addr_lower] = json.dumps(dapp_health)
+        
+        return {
+            "success": True,
+            "dapp": dapp_name,
+            "address": dapp_addr,
+            "status": "registered",
+            "health_analysis": dapp_health,
+            "message": f"{dapp_name} registered and health-checked"
+        }
+
+
+    @gl.public.view
+    def scan_wallet_security(self, wallet_addr: str) -> dict:
+        """
+        Scan a wallet for security risks and exposure.
+        Shows all contracts interacted with and their health status.
+
+        Args:
+            wallet_addr: Wallet address to scan
+
+        Returns:
+            dict: Complete wallet security report
+        """
+        wallet_lower = wallet_addr.lower()
+        
+        # Get wallet's interaction history
+        watched = []
+        if wallet_lower in self.user_watched_list:
+            try:
+                watched = json.loads(self.user_watched_list[wallet_lower])
+            except:
+                watched = []
+        
+        # Analyze each contract
+        total_risk = 0
+        contracts_scanned = 0
+        high_risk_contracts = []
+        warning_contracts = []
+        safe_contracts = []
+        
+        contract_analysis = []
+        for contract_addr in watched:
+            if contract_addr.lower() in self.watched_contracts:
+                try:
+                    contract_data = json.loads(self.watched_contracts[contract_addr.lower()])
+                    risk = contract_data.get("initial_risk", "unknown")
+                    name = contract_data.get("name", "Unknown")
+                    
+                    contract_analysis.append({
+                        "contract": contract_addr,
+                        "name": name,
+                        "risk": risk,
+                        "type": contract_data.get("contract_type", "unknown")
+                    })
+                    
+                    contracts_scanned += 1
+                    
+                    # Categorize
+                    if risk == "critical" or risk == "high":
+                        high_risk_contracts.append(name)
+                    elif risk == "medium":
+                        warning_contracts.append(name)
+                    else:
+                        safe_contracts.append(name)
+                        
+                except:
+                    pass
+        
+        # Calculate wallet health score
+        health_score = 100
+        if contracts_scanned > 0:
+            health_score = max(0, 100 - (len(high_risk_contracts) * 25) - (len(warning_contracts) * 10))
+        
+        # Update wallet health
+        self.wallet_health_scores[wallet_lower] = u256(health_score)
+        
+        # Determine overall status
+        overall_status = "healthy"
+        if health_score < 30:
+            overall_status = "critical"
+        elif health_score < 60:
+            overall_status = "warning"
+        
+        return {
+            "status": "scan_complete",
+            "wallet": wallet_addr,
+            "health_score": health_score,
+            "overall_status": overall_status,
+            "contracts_analyzed": contracts_scanned,
+            "breakdown": {
+                "safe_contracts": len(safe_contracts),
+                "warning_contracts": len(warning_contracts),
+                "high_risk_contracts": len(high_risk_contracts)
+            },
+            "high_risk_list": high_risk_contracts,
+            "warning_list": warning_contracts,
+            "detailed_analysis": contract_analysis,
+            "recommendation": "Critical action needed!" if overall_status == "critical" else "Monitor high-risk contracts" if overall_status == "warning" else "Your wallet appears safe"
+        }
+
+
+    @gl.public.view
+    def get_dapp_health_status(self, dapp_addr: str) -> dict:
+        """
+        Get real-time health status of a dApp.
+        Called by users BEFORE interacting to check if dApp is healthy.
+
+        Args:
+            dapp_addr: dApp contract address
+
+        Returns:
+            dict: Complete health and warning information
+        """
+        addr_lower = dapp_addr.lower()
+        
+        if addr_lower not in self.dapp_health_status:
+            return {
+                "status": "not_registered",
+                "dapp": dapp_addr,
+                "message": "dApp not in SecurityGuard registry. Register it first.",
+                "recommendation": "Unknown dApp - use with caution"
+            }
+        
+        try:
+            health_data = json.loads(self.dapp_health_status[addr_lower])
+        except:
+            return {
+                "status": "error",
+                "dapp": dapp_addr,
+                "message": "Could not load dApp health data"
+            }
+        
+        # Get dApp info
+        dapp_info = {}
+        if addr_lower in self.dapp_registry:
+            try:
+                dapp_info = json.loads(self.dapp_registry[addr_lower])
+            except:
+                pass
+        
+        health_status = health_data.get("health_status", "unknown")
+        
+        # Visual indicator
+        status_icon = "🟢" if health_status == "healthy" else "🟡" if health_status == "warning" else "🔴"
+        
+        return {
+            "status": "health_check_complete",
+            "dapp": dapp_info.get("name", "Unknown"),
+            "address": dapp_addr,
+            "health_icon": status_icon,
+            "health_status": health_status,
+            "risk_level": health_data.get("risk_level", "unknown"),
+            "security_issues": health_data.get("security_issues", []),
+            "audit_status": health_data.get("audit_status", "unknown"),
+            "warnings": health_data.get("warnings", []),
+            "recommendation": health_data.get("recommendation", ""),
+            "safe_to_interact": health_status == "healthy",
+            "warning_before_use": health_status in ["warning", "critical"]
+        }
+
+
+    @gl.public.write
+    def warn_on_unhealthy_dapp_interaction(self, dapp_addr: str, function_name: str) -> dict:
+        """
+        Trigger warning if user is about to interact with unhealthy dApp.
+        Real-time health check during transaction.
+
+        Args:
+            dapp_addr: dApp contract user wants to interact with
+            function_name: Function being called
+
+        Returns:
+            dict: Warning with action recommendation
+        """
+        user = str(gl.message.sender_address)
+        addr_lower = dapp_addr.lower()
+        
+        # Get dApp health
+        health_check = self.get_dapp_health_status(dapp_addr)
+        
+        if not health_check.get("safe_to_interact", True):
+            # Create warning entry
+            warning_entry = json.dumps({
+                "user": user,
+                "dapp": dapp_addr,
+                "function": function_name,
+                "health_status": health_check.get("health_status", "unknown"),
+                "warnings": health_check.get("warnings", []),
+                "timestamp": "current",
+                "action_taken": "warning_issued"
+            })
+            self.pre_interaction_warnings.append(warning_entry)
+            
+            return {
+                "warning": True,
+                "severity": "critical" if health_check.get("health_status") == "critical" else "high",
+                "dapp": health_check.get("dapp", "Unknown"),
+                "message": f"⚠️ WARNING: This dApp is currently {health_check.get('health_status')}",
+                "issues": health_check.get("security_issues", []),
+                "recommendation": health_check.get("recommendation", ""),
+                "proceed_anyway": False,
+                "unsafe_contract": True
+            }
+        
+        return {
+            "warning": False,
+            "dapp": health_check.get("dapp", "Unknown"),
+            "message": "dApp health check passed. Safe to interact.",
+            "health_status": health_check.get("health_status", "unknown"),
+            "proceed_anyway": True
+        }
+
+
+    @gl.public.view
+    def get_wallet_risk_dashboard(self, wallet_addr: str) -> dict:
+        """
+        Get comprehensive wallet security dashboard.
+        Shows everything: health, risks, warnings, recommendations.
+
+        Args:
+            wallet_addr: Wallet to analyze
+
+        Returns:
+            dict: Complete dashboard with all metrics
+        """
+        wallet_lower = wallet_addr.lower()
+        
+        # Get wallet health score
+        health_score = 100
+        if wallet_lower in self.wallet_health_scores:
+            health_score = int(self.wallet_health_scores[wallet_lower])
+        
+        # Scan wallet security
+        scan_result = self.scan_wallet_security(wallet_addr)
+        
+        # Get pending warnings for this wallet
+        pending_warnings = []
+        for warning in self.pre_interaction_warnings:
+            try:
+                warn_data = json.loads(warning)
+                if warn_data.get("user", "").lower() == wallet_lower:
+                    pending_warnings.append({
+                        "dapp": warn_data.get("dapp", "Unknown"),
+                        "issue": warn_data.get("function", "Unknown function"),
+                        "severity": "high"
+                    })
+            except:
+                pass
+        
+        # Determine overall wallet status
+        status_icon = "🟢" if health_score > 70 else "🟡" if health_score > 40 else "🔴"
+        status_text = "Safe" if health_score > 70 else "Warning" if health_score > 40 else "Critical"
+        
+        return {
+            "wallet": wallet_addr,
+            "overall_status": status_text,
+            "status_icon": status_icon,
+            "health_score": health_score,
+            "security_metrics": {
+                "safe_contracts": scan_result.get("breakdown", {}).get("safe_contracts", 0),
+                "warning_contracts": scan_result.get("breakdown", {}).get("warning_contracts", 0),
+                "high_risk_contracts": scan_result.get("breakdown", {}).get("high_risk_contracts", 0),
+                "total_contracts": scan_result.get("contracts_analyzed", 0)
+            },
+            "pending_warnings": pending_warnings,
+            "recent_high_risk": scan_result.get("high_risk_list", []),
+            "actions_recommended": [
+                "Review high-risk contracts" if scan_result.get("high_risk_contracts", 0) > 0 else None,
+                "Update security settings" if health_score < 60 else None,
+                "Enable wallet monitoring" if not self.monitoring_enabled else None
+            ],
+            "quick_actions": {
+                "scan_wallet": True,
+                "check_dapp_health": True,
+                "view_interaction_history": True,
+                "get_safer_alternatives": True
+            }
         }
 
     # ==================== INTERNAL HELPERS ====================
