@@ -63,6 +63,14 @@ class SecurityGuard(gl.Contract):
     system_uptime: u256  # Contract uptime in seconds
     created_at: u256  # Contract creation timestamp
 
+    # NEW: User wallet & dApp contract monitoring
+    watched_contracts: TreeMap[str, str]  # Contract address → risk profile JSON
+    user_contract_interactions: TreeMap[str, str]  # User address → interaction history JSON
+    contract_audit_status: TreeMap[str, str]  # Contract address → audit/security info JSON
+    user_watched_list: TreeMap[str, str]  # User → list of contracts they watch JSON
+    pre_interaction_warnings: DynArray[str]  # Warnings about upcoming interactions
+    contract_vulnerability_db: DynArray[str]  # Known vulnerabilities database
+
 
     # ==================== CONSTRUCTOR ====================
 
@@ -110,6 +118,8 @@ class SecurityGuard(gl.Contract):
 
         # Note: blacklist, whitelist, tracked_addresses, risk_scores, scan_history
         # threat_alerts, ai_recommendations, predicted_threats, threat_trends
+        # user_contract_interactions, watched_contracts, contract_audit_status
+        # user_watched_list, pre_interaction_warnings, contract_vulnerability_db
         # are auto-initialized as empty DynArrays/TreeMaps by the storage system
 
 
@@ -1282,6 +1292,453 @@ Return JSON: {{
             "total_issues": len(issues) + len(warnings),
             "system_ready": len(issues) == 0,
             "diagnostic_timestamp": "current"
+        }
+
+
+    # ==================== NEW: USER WALLET & dAPP MONITORING ====================
+
+    @gl.public.write
+    def add_contract_to_watch(self, contract_addr: str, contract_name: str) -> dict:
+        """
+        User adds a contract to their watch list.
+        Proactively monitor contracts before/during interaction.
+
+        Args:
+            contract_addr: Contract address to monitor
+            contract_name: User-friendly name for contract
+
+        Returns:
+            dict: Confirmation with initial risk assessment
+        """
+        user = str(gl.message.sender_address)
+        addr_lower = contract_addr.lower()
+
+        # Check if already watching
+        if addr_lower in self.watched_contracts:
+            return {
+                "success": False,
+                "reason": "Already monitoring this contract",
+                "contract": contract_addr,
+                "name": contract_name
+            }
+
+        # AI analyze contract before adding to watch list
+        def analyze_contract() -> str:
+            prompt = f"""Analyze this smart contract address for security risks:
+
+Contract Address: {contract_addr}
+Contract Name: {contract_name}
+
+Based on common DeFi vulnerabilities and blockchain threats, provide:
+1. Initial risk assessment (low/medium/high/critical)
+2. Likely purpose (DEX, lending, staking, etc.)
+3. Known risks to watch for
+4. Red flags in interaction patterns
+5. Recommended precautions
+
+Return JSON: {{
+    "initial_risk": "<low|medium|high|critical>",
+    "contract_type": "<type>",
+    "risks_to_watch": ["<risk1>", "<risk2>"],
+    "red_flags": ["<flag1>", "<flag2>"],
+    "precautions": ["<action1>", "<action2>"],
+    "audit_recommended": <true|false>
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        analysis_raw = gl.eq_principle.prompt_non_comparative(
+            analyze_contract,
+            task="Analyze contract for security",
+            criteria="Risk must be low/medium/high/critical. Include actionable precautions."
+        )
+
+        risk_data = self._parse_llm_json(analysis_raw, {
+            "initial_risk": "unknown",
+            "contract_type": "unknown",
+            "risks_to_watch": [],
+            "red_flags": [],
+            "precautions": [],
+            "audit_recommended": False
+        })
+
+        # Store contract risk profile
+        self.watched_contracts[addr_lower] = json.dumps({
+            "name": contract_name,
+            "address": contract_addr,
+            "initial_risk": risk_data.get("initial_risk", "unknown"),
+            "contract_type": risk_data.get("contract_type", "unknown"),
+            "risks": risk_data.get("risks_to_watch", []),
+            "red_flags": risk_data.get("red_flags", []),
+            "precautions": risk_data.get("precautions", []),
+            "audit_needed": risk_data.get("audit_recommended", False),
+            "added_at": "current"
+        })
+
+        # Add to user's watch list
+        if user in self.user_watched_list:
+            try:
+                user_list = json.loads(self.user_watched_list[user])
+                if contract_addr not in user_list:
+                    user_list.append(contract_addr)
+                    self.user_watched_list[user] = json.dumps(user_list)
+            except:
+                self.user_watched_list[user] = json.dumps([contract_addr])
+        else:
+            self.user_watched_list[user] = json.dumps([contract_addr])
+
+        return {
+            "success": True,
+            "contract": contract_addr,
+            "name": contract_name,
+            "risk_assessment": risk_data,
+            "monitoring_started": True,
+            "alert_on": "high+ risk transactions"
+        }
+
+
+    @gl.public.write
+    def analyze_contract_before_interaction(
+        self,
+        contract_addr: str,
+        function_name: str,
+        params: str,
+        value_eth: str
+    ) -> dict:
+        """
+        Before interacting with a contract, get AI security analysis.
+        PROACTIVE: Get warning BEFORE you interact.
+
+        Args:
+            contract_addr: Contract you want to interact with
+            function_name: Function you want to call
+            params: Function parameters
+            value_eth: ETH amount to send (0 if none)
+
+        Returns:
+            dict: Risk assessment + warnings + recommendations
+        """
+        user = str(gl.message.sender_address)
+        addr_lower = contract_addr.lower()
+
+        # Get or fetch contract risk profile
+        contract_risk = {}
+        if addr_lower in self.watched_contracts:
+            try:
+                contract_risk = json.loads(self.watched_contracts[addr_lower])
+            except:
+                contract_risk = {}
+
+        # AI analyze specific interaction
+        def analyze_interaction() -> str:
+            prompt = f"""Analyze this specific smart contract interaction for security:
+
+User: {user}
+Contract: {contract_addr} ({contract_risk.get('contract_type', 'unknown')})
+Function: {function_name}
+Parameters: {params}
+Value Sent: {value_eth} ETH
+
+Based on common exploits and scam patterns, assess:
+1. Safety of this specific interaction
+2. Risks associated with this function
+3. Common scams targeting this function
+4. Recommended precautions BEFORE confirming
+5. If you should proceed or wait
+6. What to verify in the transaction
+
+Return JSON: {{
+    "interaction_risk": "<safe|caution|dangerous|critical>",
+    "reason": "<brief explanation>",
+    "function_risks": ["<risk1>"],
+    "common_scams": ["<scam1>"],
+    "precautions_before_tx": ["<action1>"],
+    "should_proceed": <true|false>,
+    "verify_these": ["<verify1>"],
+    "confidence": 0-100
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        interaction_raw = gl.eq_principle.prompt_non_comparative(
+            analyze_interaction,
+            task="Analyze contract interaction safety",
+            criteria="Interaction risk must be safe/caution/dangerous/critical. Include precautions."
+        )
+
+        interaction_data = self._parse_llm_json(interaction_raw, {
+            "interaction_risk": "unknown",
+            "reason": "Could not analyze",
+            "function_risks": [],
+            "common_scams": [],
+            "precautions_before_tx": [],
+            "should_proceed": True,
+            "verify_these": [],
+            "confidence": 0
+        })
+
+        # Store as warning if high risk
+        if interaction_data.get("interaction_risk") in ["dangerous", "critical"]:
+            warning = json.dumps({
+                "user": user,
+                "contract": contract_addr,
+                "function": function_name,
+                "risk": interaction_data.get("interaction_risk"),
+                "reason": interaction_data.get("reason"),
+                "timestamp": "current"
+            })
+            self.pre_interaction_warnings.append(warning)
+
+        return {
+            "status": "analyzed",
+            "contract": contract_addr,
+            "function": function_name,
+            "interaction_risk": interaction_data.get("interaction_risk", "unknown"),
+            "reason": interaction_data.get("reason", ""),
+            "precautions": interaction_data.get("precautions_before_tx", []),
+            "should_proceed": interaction_data.get("should_proceed", True),
+            "verify_before_confirming": interaction_data.get("verify_these", []),
+            "common_scams_to_watch": interaction_data.get("common_scams", []),
+            "confidence_percent": interaction_data.get("confidence", 0),
+            "action": "STOP - High Risk!" if not interaction_data.get("should_proceed") else "OK to proceed with caution"
+        }
+
+
+    @gl.public.view
+    def get_contract_risk_profile(self, contract_addr: str) -> dict:
+        """
+        Get complete risk profile of a contract.
+        Use BEFORE deciding to interact.
+
+        Args:
+            contract_addr: Contract to analyze
+
+        Returns:
+            dict: Risk profile with all known issues
+        """
+        addr_lower = contract_addr.lower()
+
+        if addr_lower not in self.watched_contracts:
+            return {
+                "status": "not_monitored",
+                "contract": contract_addr,
+                "message": "Add this contract to watch list first",
+                "recommendation": "Call add_contract_to_watch() first"
+            }
+
+        try:
+            contract_data = json.loads(self.watched_contracts[addr_lower])
+        except:
+            return {
+                "status": "error",
+                "contract": contract_addr,
+                "message": "Could not load contract data"
+            }
+
+        # Count tracked threats for this contract
+        threat_count = 0
+        for i in range(len(self.tracked_addresses)):
+            if self.tracked_addresses[i].lower() == addr_lower:
+                threat_count += 1
+
+        risk_icon = "🟢" if contract_data.get("initial_risk") == "low" else \
+                   "🟡" if contract_data.get("initial_risk") == "medium" else \
+                   "🔴" if contract_data.get("initial_risk") == "high" else "⛔"
+
+        return {
+            "status": "monitored",
+            "contract": contract_addr,
+            "name": contract_data.get("name", "Unknown"),
+            "risk_icon": risk_icon,
+            "initial_risk": contract_data.get("initial_risk", "unknown"),
+            "contract_type": contract_data.get("contract_type", "unknown"),
+            "risks_to_watch": contract_data.get("risks", []),
+            "red_flags": contract_data.get("red_flags", []),
+            "precautions": contract_data.get("precautions", []),
+            "audit_needed": contract_data.get("audit_needed", False),
+            "threats_detected": threat_count,
+            "recommendation": "Safe to use" if contract_data.get("initial_risk") in ["low", "medium"] else "Review before interacting"
+        }
+
+
+    @gl.public.view
+    def get_user_interaction_history(self, user_addr: str) -> dict:
+        """
+        Get user's contract interaction history.
+        See which dApps you've used and their security status.
+
+        Args:
+            user_addr: User wallet address
+
+        Returns:
+            dict: Interaction history with risks
+        """
+        user_lower = user_addr.lower()
+
+        # Get watched contracts for this user
+        watched = []
+        if user_lower in self.user_watched_list:
+            try:
+                watched = json.loads(self.user_watched_list[user_lower])
+            except:
+                watched = []
+
+        # Get interaction history if stored
+        interaction_history = []
+        if user_lower in self.user_contract_interactions:
+            try:
+                history_data = json.loads(self.user_contract_interactions[user_lower])
+                interaction_history = history_data.get("interactions", [])
+            except:
+                interaction_history = []
+
+        # Build profile for each watched contract
+        contract_profiles = []
+        for contract_addr in watched:
+            if contract_addr.lower() in self.watched_contracts:
+                try:
+                    contract_data = json.loads(self.watched_contracts[contract_addr.lower()])
+                    contract_profiles.append({
+                        "contract": contract_addr,
+                        "name": contract_data.get("name", "Unknown"),
+                        "risk": contract_data.get("initial_risk", "unknown"),
+                        "type": contract_data.get("contract_type", "unknown"),
+                        "interactions": len([i for i in interaction_history if i.get("contract") == contract_addr])
+                    })
+                except:
+                    pass
+
+        return {
+            "user": user_addr,
+            "total_watched_contracts": len(watched),
+            "watched_contracts": contract_profiles,
+            "total_interactions": len(interaction_history),
+            "recent_interactions": interaction_history[-5:] if interaction_history else [],
+            "high_risk_contracts": len([c for c in contract_profiles if c.get("risk") in ["high", "critical"]]),
+            "recommendation": "Monitor high-risk contracts closely"
+        }
+
+
+    @gl.public.view
+    def monitor_dapp_contracts(self) -> dict:
+        """
+        Global view: Monitor ALL dApps/contracts being watched.
+        Dashboard for security team to see what users interact with.
+
+        Returns:
+            dict: DApp monitoring dashboard
+        """
+        total_contracts = 0
+        high_risk_count = 0
+        low_risk_count = 0
+        audit_needed_count = 0
+
+        contract_list = []
+
+        # Scan all watched contracts (TreeMap doesn't iterate, so we use tracked for overview)
+        for i in range(len(self.tracked_addresses)):
+            contract_addr = self.tracked_addresses[i]
+            if contract_addr in self.watched_contracts:
+                try:
+                    data = json.loads(self.watched_contracts[contract_addr])
+                    total_contracts += 1
+
+                    risk = data.get("initial_risk", "unknown")
+                    if risk == "high":
+                        high_risk_count += 1
+                    elif risk == "low":
+                        low_risk_count += 1
+
+                    if data.get("audit_needed", False):
+                        audit_needed_count += 1
+
+                    contract_list.append({
+                        "name": data.get("name", "Unknown"),
+                        "address": contract_addr,
+                        "risk": risk,
+                        "type": data.get("contract_type", "unknown"),
+                        "red_flags": len(data.get("red_flags", []))
+                    })
+                except:
+                    pass
+
+        return {
+            "status": "monitoring_active",
+            "total_dapps_monitored": total_contracts,
+            "high_risk_dapps": high_risk_count,
+            "safe_dapps": low_risk_count,
+            "require_audit": audit_needed_count,
+            "dapp_list": contract_list[:20],  # Top 20
+            "alerts": pre_interaction_warnings_count := len(self.pre_interaction_warnings),
+            "action_items": high_risk_count + audit_needed_count
+        }
+
+
+    @gl.public.view
+    def get_safer_alternatives(self) -> dict:
+        """
+        Get recommendations for SAFER dApp/contract alternatives.
+        If a contract is risky, AI suggests safer options.
+
+        Returns:
+            dict: Safer alternatives based on use case
+        """
+        # Analyze patterns of watched contracts
+        contract_use_cases = {}
+        for i in range(len(self.tracked_addresses)):
+            contract_addr = self.tracked_addresses[i]
+            if contract_addr in self.watched_contracts:
+                try:
+                    data = json.loads(self.watched_contracts[contract_addr])
+                    use_case = data.get("contract_type", "unknown")
+                    if use_case not in contract_use_cases:
+                        contract_use_cases[use_case] = []
+                    contract_use_cases[use_case].append({
+                        "name": data.get("name", "Unknown"),
+                        "risk": data.get("initial_risk", "unknown")
+                    })
+                except:
+                    pass
+
+        # AI recommend safer alternatives
+        def get_recommendations() -> str:
+            prompt = f"""Based on these dApp/contract use cases and risk levels:
+
+{json.dumps(contract_use_cases)}
+
+Recommend SAFER alternatives for each use case:
+1. Identify high-risk contracts
+2. Suggest well-audited, safer alternatives
+3. Explain why they're safer
+4. Rate each alternative
+
+Return JSON: {{
+    "safer_alternatives": {{
+        "<use_case>": [
+            {{"recommended": "<name>", "why_safer": "<reason>", "rating": "<excellent|good|fair>"}}
+        ]
+    }},
+    "general_safety_tips": ["<tip1>"],
+    "priority_switches": ["<switch1>"]
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        rec_raw = gl.eq_principle.prompt_non_comparative(
+            get_recommendations,
+            task="Recommend safer dApp alternatives",
+            criteria="Include specific safer alternatives with explanations"
+        )
+
+        recommendations = self._parse_llm_json(rec_raw, {
+            "safer_alternatives": {},
+            "general_safety_tips": ["Research before interacting", "Start with small amounts"],
+            "priority_switches": []
+        })
+
+        return {
+            "status": "recommendations_generated",
+            "safer_alternatives": recommendations.get("safer_alternatives", {}),
+            "safety_tips": recommendations.get("general_safety_tips", []),
+            "priority_switches": recommendations.get("priority_switches", []),
+            "message": "Review safer alternatives before interacting with high-risk contracts"
         }
 
     # ==================== INTERNAL HELPERS ====================
