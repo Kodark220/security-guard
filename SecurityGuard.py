@@ -76,6 +76,12 @@ class SecurityGuard(gl.Contract):
     dapp_registry: TreeMap[str, str]  # dApp contract → integration info JSON
     wallet_health_scores: TreeMap[str, u256]  # Wallet → overall health score (0-100)
     dapp_health_status: TreeMap[str, str]  # dApp → health status (healthy/warning/critical) JSON
+    
+    # NEW: Token allowance tracking & risk management
+    token_approvals: TreeMap[str, str]  # User→Token→Spender → approval data JSON
+    dangerous_approvals: DynArray[str]  # List of dangerous infinite approvals
+    user_custom_thresholds: TreeMap[str, str]  # User → custom threshold settings JSON
+    tx_simulation_history: DynArray[str]  # Transaction simulation results
 
 
     # ==================== CONSTRUCTOR ====================
@@ -2139,6 +2145,382 @@ Return JSON: {{
                 "view_interaction_history": True,
                 "get_safer_alternatives": True
             }
+        }
+
+    # ==================== TOKEN ALLOWANCE & APPROVAL MONITORING ====================
+
+    @gl.public.write
+    def track_token_approval(self, token_addr: str, spender_addr: str, amount: str) -> dict:
+        """
+        Track token allowance given to a spender.
+        CRITICAL: Detects infinite/dangerous approvals.
+
+        Args:
+            token_addr: Token contract address
+            spender_addr: Contract/address receiving approval
+            amount: Approval amount (uint256 as string, "unlimited" for infinite)
+
+        Returns:
+            dict: Approval risk assessment
+        """
+        user = str(gl.message.sender_address)
+        approval_key = f"{user.lower()}:{token_addr.lower()}:{spender_addr.lower()}"
+        
+        # Check if infinite approval (dangerous!)
+        is_infinite = amount.lower() in ["unlimited", "infinite", "max", "2**256-1"]
+        
+        approval_data = {
+            "user": user,
+            "token": token_addr,
+            "spender": spender_addr,
+            "amount": amount,
+            "is_infinite": is_infinite,
+            "approved_at": "current",
+            "risk_level": "critical" if is_infinite else "medium"
+        }
+        
+        self.token_approvals[approval_key] = json.dumps(approval_data)
+        
+        # If infinite, add to dangerous list
+        if is_infinite:
+            danger_entry = json.dumps({
+                "user": user,
+                "token": token_addr,
+                "spender": spender_addr,
+                "approved_at": "current",
+                "action": "infinite_approval_granted"
+            })
+            self.dangerous_approvals.append(danger_entry)
+        
+        # AI analyze spender safety
+        def analyze_spender() -> str:
+            prompt = f"""Analyze this token spender for safety:
+
+Token: {token_addr}
+Spender Address: {spender_addr}
+Approval Amount: {amount}
+Is Infinite: {is_infinite}
+
+Check:
+1. Is this a known safe contract (Uniswap, AAVE, etc.)?
+2. Are there known exploits targeting this spender?
+3. How risky is infinite approval to this contract?
+4. What's the likelihood of fund theft?
+
+Return JSON: {{
+    "spender_name": "<contract_name>",
+    "is_known_safe": <true|false>,
+    "risk_score": 0-100,
+    "known_exploits": ["<exploit1>"],
+    "recommendation": "<action>",
+    "warning": "<warning_if_any>"
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        analysis_raw = gl.eq_principle.prompt_non_comparative(
+            analyze_spender,
+            task="Analyze token spender safety",
+            criteria="Risk score 0-100, identify if known safe contract"
+        )
+
+        spender_analysis = self._parse_llm_json(analysis_raw, {
+            "spender_name": "Unknown",
+            "is_known_safe": False,
+            "risk_score": 50,
+            "known_exploits": [],
+            "recommendation": "Review before approving",
+            "warning": "Unknown spender - use with caution"
+        })
+
+        return {
+            "status": "approval_tracked",
+            "token": token_addr,
+            "spender": spender_addr,
+            "amount": amount,
+            "is_infinite": is_infinite,
+            "spender_analysis": spender_analysis,
+            "warning": "🚨 DANGER: Infinite approval!" if is_infinite else None,
+            "recommendation": spender_analysis.get("recommendation", ""),
+            "risk_level": "critical" if is_infinite else "medium" if spender_analysis.get("risk_score", 50) > 70 else "low"
+        }
+
+
+    @gl.public.view
+    def check_dangerous_approvals(self, wallet_addr: str) -> dict:
+        """
+        Check if wallet has any dangerous infinite approvals.
+        Returns list of tokens/contracts with unlimited spend rights.
+
+        Args:
+            wallet_addr: Wallet to check
+
+        Returns:
+            dict: List of risky approvals with revoke recommendations
+        """
+        user_lower = wallet_addr.lower()
+        dangerous_list = []
+        
+        for approval_entry in self.dangerous_approvals:
+            try:
+                approval = json.loads(approval_entry)
+                if approval.get("user", "").lower() == user_lower:
+                    dangerous_list.append({
+                        "token": approval.get("token", "Unknown"),
+                        "spender": approval.get("spender", "Unknown"),
+                        "approved_at": approval.get("approved_at", ""),
+                        "action_needed": "REVOKE THIS APPROVAL"
+                    })
+            except:
+                pass
+        
+        severity = "critical" if len(dangerous_list) > 0 else "safe"
+        
+        return {
+            "wallet": wallet_addr,
+            "dangerous_approvals_found": len(dangerous_list),
+            "severity": severity,
+            "approvals": dangerous_list,
+            "recommendation": f"⚠️ IMMEDIATE ACTION: Revoke {len(dangerous_list)} dangerous approvals" if dangerous_list else "✅ No infinite approvals found",
+            "how_to_revoke": "Use token contract's approve() function with spender and amount=0"
+        }
+
+
+    @gl.public.write
+    def set_custom_risk_thresholds(
+        self,
+        critical: u256,
+        high: u256,
+        medium: u256
+    ) -> dict:
+        """
+        Set custom risk thresholds for specific user.
+        Different users have different risk tolerance.
+
+        Args:
+            critical: Critical threshold (auto-pause at this level)
+            high: High alert threshold
+            medium: Medium alert threshold
+
+        Returns:
+            dict: Custom thresholds saved confirmation
+        """
+        user = str(gl.message.sender_address)
+        
+        # Validate
+        if not (int(critical) > int(high) > int(medium)):
+            return {"success": False, "error": "Thresholds must satisfy: critical > high > medium"}
+        
+        if int(critical) > 100 or int(medium) < 0:
+            return {"success": False, "error": "Thresholds must be between 0-100"}
+        
+        # Store custom thresholds
+        thresholds = {
+            "user": user,
+            "critical": int(critical),
+            "high": int(high),
+            "medium": int(medium),
+            "set_at": "current"
+        }
+        
+        self.user_custom_thresholds[user] = json.dumps(thresholds)
+        
+        return {
+            "success": True,
+            "user": user,
+            "custom_thresholds": {
+                "critical": int(critical),
+                "high": int(high),
+                "medium": int(medium)
+            },
+            "message": "Custom thresholds saved. Future scans will use your risk preferences."
+        }
+
+
+    @gl.public.view
+    def get_user_thresholds(self, wallet_addr: str) -> dict:
+        """
+        Get user's risk thresholds (custom or default).
+
+        Args:
+            wallet_addr: Wallet address
+
+        Returns:
+            dict: Current thresholds being used
+        """
+        # Check for custom thresholds
+        if wallet_addr in self.user_custom_thresholds:
+            try:
+                custom = json.loads(self.user_custom_thresholds[wallet_addr])
+                return {
+                    "status": "custom_thresholds_active",
+                    "thresholds": {
+                        "critical": custom.get("critical"),
+                        "high": custom.get("high"),
+                        "medium": custom.get("medium")
+                    },
+                    "set_by": "user",
+                    "set_at": custom.get("set_at")
+                }
+            except:
+                pass
+        
+        # Return system defaults
+        return {
+            "status": "using_default_thresholds",
+            "thresholds": {
+                "critical": int(self.critical_threshold),
+                "high": int(self.high_threshold),
+                "medium": int(self.medium_threshold)
+            },
+            "set_by": "system",
+            "message": "Using default thresholds. Call set_custom_risk_thresholds() to customize."
+        }
+
+
+    @gl.public.write
+    def simulate_transaction(
+        self,
+        to_addr: str,
+        function: str,
+        params: str,
+        value_eth: str
+    ) -> dict:
+        """
+        Simulate transaction BEFORE executing.
+        Shows what will happen: success/fail, gas, output, etc.
+
+        Args:
+            to_addr: Contract address
+            function: Function name
+            params: Parameters
+            value_eth: ETH value
+
+        Returns:
+            dict: Transaction simulation results
+        """
+        user = str(gl.message.sender_address)
+        
+        # AI simulate the transaction
+        def simulate() -> str:
+            prompt = f"""Simulate this blockchain transaction:
+
+User: {user}
+Target: {to_addr}
+Function: {function}
+Parameters: {params}
+Value: {value_eth} ETH
+
+Predict:
+1. Will this transaction succeed or fail? Why?
+2. Estimated gas cost (rough estimate)
+3. What is the output/result?
+4. Are there any hidden risks?
+5. Is there slippage/fees involved?
+6. Any front-running susceptibility?
+
+Return JSON: {{
+    "will_succeed": <true|false>,
+    "failure_reason": "<reason_if_fails>",
+    "estimated_gas": "<estimate>",
+    "expected_output": "<output>",
+    "risks": ["<risk1>"],
+    "slippage_risk": "<low|medium|high>",
+    "front_run_risk": "<low|medium|high>",
+    "recommendation": "<do_it_or_skip>"
+}}"""
+            return gl.nondet.exec_prompt(prompt)
+
+        sim_raw = gl.eq_principle.prompt_non_comparative(
+            simulate,
+            task="Simulate transaction execution",
+            criteria="Predict success/failure and identify risks"
+        )
+
+        simulation = self._parse_llm_json(sim_raw, {
+            "will_succeed": False,
+            "failure_reason": "Could not simulate",
+            "estimated_gas": "Unknown",
+            "expected_output": "Unknown",
+            "risks": [],
+            "slippage_risk": "unknown",
+            "front_run_risk": "unknown",
+            "recommendation": "Manual review required"
+        })
+        
+        # Store simulation
+        sim_entry = json.dumps({
+            "user": user,
+            "target": to_addr,
+            "function": function,
+            "simulation": simulation,
+            "timestamp": "current"
+        })
+        self.tx_simulation_history.append(sim_entry)
+        
+        return {
+            "status": "simulation_complete",
+            "function": function,
+            "will_succeed": simulation.get("will_succeed", False),
+            "failure_reason": simulation.get("failure_reason", ""),
+            "estimated_gas": simulation.get("estimated_gas", ""),
+            "expected_output": simulation.get("expected_output", ""),
+            "risks_detected": simulation.get("risks", []),
+            "slippage_risk": simulation.get("slippage_risk", "unknown"),
+            "front_run_risk": simulation.get("front_run_risk", "unknown"),
+            "recommendation": simulation.get("recommendation", ""),
+            "safe_to_execute": simulation.get("will_succeed", False) and simulation.get("slippage_risk", "high") != "high"
+        }
+
+
+    @gl.public.view
+    def get_approval_safety_report(self, wallet_addr: str) -> dict:
+        """
+        Complete approval safety audit for wallet.
+        Shows all approvals and their safety status.
+
+        Returns:
+            dict: Full approval audit report
+        """
+        user_lower = wallet_addr.lower()
+        
+        # Count dangerous approvals
+        dangerous_count = 0
+        dangerous_details = []
+        
+        for approval_entry in self.dangerous_approvals:
+            try:
+                approval = json.loads(approval_entry)
+                if approval.get("user", "").lower() == user_lower:
+                    dangerous_count += 1
+                    dangerous_details.append({
+                        "token": approval.get("token", "Unknown"),
+                        "spender": approval.get("spender", "Unknown"),
+                        "approved_at": approval.get("approved_at", ""),
+                        "severity": "critical"
+                    })
+            except:
+                pass
+        
+        overall_safety = "critical" if dangerous_count > 0 else "safe"
+        
+        return {
+            "wallet": wallet_addr,
+            "overall_safety": overall_safety,
+            "dangerous_approvals": dangerous_count,
+            "dangerous_details": dangerous_details,
+            "actions_required": dangerous_count,
+            "approval_audit": {
+                "total_dangerous": dangerous_count,
+                "critical_risk": dangerous_count > 2,
+                "recommendation": f"⚠️ URGENT: Revoke {dangerous_count} approvals immediately" if dangerous_count > 0 else "✅ Approvals are safe"
+            },
+            "safety_score": max(0, 100 - (dangerous_count * 30)),
+            "next_steps": [
+                "Review all approvals on Etherscan",
+                "Use Revoke.cash or similar to batch revoke",
+                "Only approve what you need",
+                "Revoke after transaction completes"
+            ] if dangerous_count > 0 else ["Your approvals look safe"]
         }
 
     # ==================== INTERNAL HELPERS ====================
